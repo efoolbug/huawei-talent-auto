@@ -3,7 +3,7 @@
 > 华为人才在线（`e.huawei.com/cn/talent`）课程播放辅助 · Tampermonkey 用户脚本
 > 自动倍速、静音、自动播放、播完自动切「下一讲」，带可拖拽悬浮面板。
 
-![version](https://img.shields.io/badge/version-2.1.1-blue)
+![version](https://img.shields.io/badge/version-2.2.0-blue)
 ![license](https://img.shields.io/badge/license-MIT-green)
 ![platform](https://img.shields.io/badge/platform-Chrome%20%2B%20Tampermonkey-lightgrey)
 ![javascript](https://img.shields.io/badge/language-Vanilla%20JS-yellow)
@@ -21,6 +21,7 @@
 | 自动音量 | 0%~100%；0% 时自动静音以配合浏览器自动播放策略 |
 | 自动播放 | 遵守 Chrome 自动播放策略，被拦截时给出明确提示 |
 | 自动下一讲 | 监听真实 `ended`，点击站内原生「下一讲」按钮 |
+| 多 Part 小节连播 | 一个章节里堆叠了 Part 01…Part 06 多个播放器时，先把本小节所有 Part 播完，再切下一章（2~N 个自适应） |
 | 跳过图文小节 | 无 `<video>` 的图文/课件页停留 10s 后自动下一讲（可开关；测验页不跳过） |
 | 切课保持参数 | 新视频加载后自动重新套用倍速/音量 |
 | SPA 适配 | `hashchange` + 路由轮询 + DOM 观察三路触发 |
@@ -95,6 +96,12 @@ https://raw.githubusercontent.com/efoolbug/huawei-talent-auto/main/huawei-talent
 3. **不改任何原生原型**：只在具体 `<video>` 实例上设置 `playbackRate` / `volume` / `muted`。
 
 下一讲采用 **一次性锁 + 导航变化确认 + 最多重试 1 次 + 30s 冷却**，杜绝无限切课。
+
+多 Part 小节（如 8.1 BGP路径属性 里的 Part 01~06）是**同一页面里的多个 video.js 播放器**，
+底部「上一讲 / 下一讲」是**章节级**按钮。脚本只跟踪"当前正在播的那一个"视频，
+当前 Part 播完后按页面上的 `Part 0X` 标题找到下一部分并激活播放；站点自己会接续时
+则让站点接、脚本不抢。**本小节全部 Part 播完才会点「下一讲」**，因此不会再出现
+「8.1 只播了前两个 Part 就跑到 8.2」的情况。
 
 ---
 

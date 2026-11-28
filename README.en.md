@@ -4,7 +4,7 @@
 > (`e.huawei.com/cn/talent`). Auto playback speed, mute, autoplay, and automatic
 > "next lesson" — with a compact floating control panel.
 
-![version](https://img.shields.io/badge/version-2.1.1-blue)
+![version](https://img.shields.io/badge/version-2.2.0-blue)
 ![license](https://img.shields.io/badge/license-MIT-green)
 ![platform](https://img.shields.io/badge/platform-Chrome%20%2B%20Tampermonkey-lightgrey)
 
@@ -20,6 +20,9 @@
 - Volume control; 0% auto-mutes so the browser autoplay policy allows playback
 - Autoplay with clear feedback when Chrome blocks it
 - Listens for the real `ended` event and clicks the site's own "next lesson" button
+- Multi-part sections: some chapters stack several video.js players (`Part 01…Part 0N`)
+  on one page with a chapter-level "next" button. The script plays every part of the
+  current section first and only then advances to the next chapter
 - Re-applies rate/volume after each lesson switch
 - SPA-friendly (hashchange + route polling + MutationObserver)
 - Re-binds automatically when the player element is replaced

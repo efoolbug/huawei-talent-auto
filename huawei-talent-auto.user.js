@@ -3,7 +3,7 @@
 // @namespace    HuaweiTalent
 // @author       HuaweiTalentAuto contributors
 // @license      MIT
-// @version      2.1.1
+// @version      2.2.0
 // @description  华为人才在线课程播放辅助：自动倍速/音量/播放/下一讲。修复 1.0.0 的页面空白（MutationObserver 自激循环）。
 // @match        https://e.huawei.com/cn/talent/outPage/*
 // @match        https://talent.shixizhi.huawei.com/course/*
@@ -16,6 +16,20 @@
 // ==/UserScript==
 
 /* ============================================================================
+ * 2.2.0：修复「一个章节里的多个 Part 只播 1~2 个就整段跳过」
+ *        实测有些小节（如 8.1 BGP路径属性）在同一个页面里垂直堆叠了
+ *        Part 01…Part 06 共 6 个 video.js 播放器，底部的「上一讲 / 下一讲」
+ *        是**章节级**按钮。旧逻辑里任何一个 <video> 触发 ended 都会去点它，
+ *        于是 Part 02 一播完就被带到 8.2，8.1 永远打不上勾。
+ *        现在：
+ *        1) 只跟踪「当前正在播的那一个」视频，其它堆叠播放器的 ended 一律忽略；
+ *        2) 当前 Part 播完后，先把同一小节里排在它下面的 Part 逐个激活播放
+ *           （识别页面上的 Part 0X 标题，3 个、4 个、6 个都自适应；
+ *            站点自己会接续时则让站点接，脚本不抢）；
+ *        3) 本小节全部 Part 播完，才点「下一讲」；
+ *        4) 「下一讲」只在离当前播放器最近的候选里点，避免点到其它 Part 的按钮；
+ *        5) 诊断结果会带上子框架的视频 / Part 结构，定位问题不用再开 DevTools。
+ * ============================================================================
  * 2.1.0：新增「无视频小节自动跳过」——图文/课件页没有 <video>，永远等不到
  *        ended。现在在该页停留 10s 后自动点「下一讲」；面板可开关；
  *        识别到测验/答题页面时拒绝跳过。
@@ -56,7 +70,7 @@
     pageWindow.__HTAP_ACTIVE__ = true;
   } catch (e) { return; }
 
-  const VERSION = '2.1.1';
+  const VERSION = '2.2.0';
   const IS_TOP = (function () {
     try { return window.top === window; } catch (e) { return false; }
   })();
@@ -119,8 +133,11 @@
     noVideoSince: 0,        // 当前页面「没有播放器」的起始时间（用于图文小节跳过）
     skippedHref: '',        // 已经跳过过的页面，防止重复触发
     course: { title: '', active: '' },
+    active: null,           // 当前正在跟的播放器（多 Part 堆叠时只跟"正在播的那一个"）
     // 主框架用：子框架上报的播放状态（视频在跨域 iframe 里时）
-    child: null
+    child: null,
+    // 主框架用：子框架回报的结构（诊断用）
+    childDiag: null
   };
 
   /* ------------------------------------------------------------------ *
@@ -196,29 +213,208 @@
     return out;
   }
 
-  function pickPrimary(vids) {
-    let best = null;
-    let bestScore = -1;
+  /* ---- 多 Part 小节：同一页面里可能垂直堆叠着多个播放器 ---- */
+  function absTop(el) {
+    let r;
+    try { r = el.getBoundingClientRect(); } catch (e) { return 0; }
+    return r.top + (window.pageYOffset || document.documentElement.scrollTop || 0);
+  }
+
+  // 只把"看得见、有尺寸、有媒体源或时长"的视频当作小节内的 Part
+  function partVideos(vids) {
+    const out = [];
     for (let i = 0; i < vids.length; i++) {
       const v = vids[i];
-      let s = 0;
-      if (isVisible(v)) {
-        s += 100;
-        // 画面越大越像主播放器，避免在多个 <video> 之间来回切换
-        try {
-          const r = v.getBoundingClientRect();
-          s += Math.min(60, Math.round((r.width * r.height) / 20000));
-        } catch (e) { /* 忽略 */ }
-      }
-      if (v.currentSrc || v.getAttribute('src')) s += 20;
-      if (v.readyState >= 1) s += 10;
-      if (v.readyState >= 2) s += 10;
-      if (isFinite(v.duration) && v.duration > 60) s += 15;
-      if (!v.paused) s += 30;
-      if (v.ended) s -= 80;
-      if (s > bestScore) { bestScore = s; best = v; }
+      if (!isVisible(v)) continue;
+      let w = 0;
+      try { w = v.getBoundingClientRect().width; } catch (e) { w = 0; }
+      if (w < 160) continue;
+      if (!v.currentSrc && !v.getAttribute('src') && !(isFinite(v.duration) && v.duration > 0)) continue;
+      out.push(v);
     }
-    return best;
+    return out;
+  }
+
+  function orderedVideos(vids) {
+    return vids.slice().sort(function (a, b) { return absTop(a) - absTop(b); });
+  }
+
+  let partCache = { at: 0, list: [] };
+
+  // 页面上的「Part 01 / Part 02 …」标题：用来判断当前小节里有几个部分
+  function getPartHeadings() {
+    const now = Date.now();
+    if (now - partCache.at < 2000) return partCache.list;
+    partCache.at = now;
+
+    const out = [];
+    try {
+      const all = document.querySelectorAll('body *');
+      const budget = Math.min(all.length, 4000);
+      for (let i = 0; i < budget; i++) {
+        const el = all[i];
+        if (el.children && el.children.length > 0) continue;
+        const t = String(el.textContent || '').replace(/\s+/g, ' ').trim();
+        if (!t || t.length > 12) continue;
+        if (!/^part\s*\d+$/i.test(t)) continue;
+        out.push({ el: el, top: absTop(el), n: parseInt(t.replace(/\D/g, ''), 10) || 0 });
+      }
+    } catch (e) { /* 忽略 */ }
+
+    out.sort(function (a, b) { return a.top - b.top; });
+    // 同一个标题可能同时命中父子节点，按位置去重
+    const uniq = [];
+    for (let i = 0; i < out.length; i++) {
+      if (!uniq.length || Math.abs(out[i].top - uniq[uniq.length - 1].top) > 4) uniq.push(out[i]);
+    }
+    partCache.list = uniq;
+    return uniq;
+  }
+
+  function resetPartCache() { partCache.at = 0; partCache.list = []; }
+
+  function partIndexOf(v, headings) {
+    let center;
+    try { center = absTop(v) + (v.getBoundingClientRect().height || 0) / 2; } catch (e) { center = absTop(v); }
+    let idx = -1;
+    for (let i = 0; i < headings.length; i++) {
+      if (headings[i].top <= center) idx = i;
+      else break;
+    }
+    return idx;
+  }
+
+  // 当前视频所在小节里的"下一个部分"；返回 null 表示本小节已经全部播完
+  function findNextPart(v, vids) {
+    const headings = getPartHeadings();
+    const ordered = orderedVideos(partVideos(vids || collectVideos()));
+
+    if (headings.length >= 2) {
+      const idx = partIndexOf(v, headings);
+      if (idx >= 0) {
+        if (idx >= headings.length - 1) return null;   // 已经是最后一个 Part
+        const h = headings[idx + 1];
+        const limit = headings[idx + 2] ? headings[idx + 2].top : Infinity;
+        let target = null;
+        for (let i = 0; i < ordered.length; i++) {
+          const t = absTop(ordered[i]);
+          if (t >= h.top - 2 && t < limit) { target = ordered[i]; break; }
+        }
+        return { heading: h, video: target, reason: 'Part ' + (h.n || (idx + 2)) };
+      }
+    }
+
+    // 没有分 Part 标题（或对不上）：按垂直顺序取当前视频下面的第一个
+    const i = ordered.indexOf(v);
+    if (i >= 0 && i < ordered.length - 1) {
+      return { heading: null, video: ordered[i + 1], reason: '下一部分' };
+    }
+    return null;
+  }
+
+  function adoptActive(v) {
+    state.active = v;
+    state.primary = v;
+  }
+
+  // 选"当前正在看的那一个"视频，避免在多个堆叠播放器之间乱跳
+  function resolveActive(vids) {
+    const cur = state.active;
+    let curOk = false;
+    try { curOk = !!(cur && cur.isConnected); } catch (e) { curOk = false; }
+
+    if (curOk && !cur.paused && !cur.ended && cur.currentTime > 0) return cur;
+
+    // 站点自己把下一部分接上了：跟着它走（刚开始播时 currentTime 可能还是 0，不能要求 > 0）
+    for (let i = 0; i < vids.length; i++) {
+      const v = vids[i];
+      if (v === cur) continue;
+      if (!v.paused && !v.ended && isVisible(v)) return v;
+    }
+
+    // 当前视频还在（用户手动暂停）：保持不动
+    if (curOk) return cur;
+
+    // 新页面：优先选有进度但没播完的，其次从上到下第一个
+    const ordered = orderedVideos(partVideos(vids));
+    for (let i = 0; i < ordered.length; i++) {
+      if (!ordered[i].ended && ordered[i].currentTime > 0) return ordered[i];
+    }
+    return ordered.length ? ordered[0] : null;
+  }
+
+  let partTimer = null;
+
+  function scheduleNextPart(target, fromVideo) {
+    clearTimeout(partTimer);
+    const delay = clamp(cfg.nextDelayMs, 1200, 5000);
+    log('info', '本小节还有下一部分（' + target.reason + '），先把剩余部分播完');
+    partTimer = setTimeout(function () {
+      partTimer = null;
+      goToNextPart(target, fromVideo, 0);
+    }, delay);
+  }
+
+  // 激活小节的下一部分：站点自己会接就让它接，不抢；接不上才自己播
+  function goToNextPart(target, fromVideo, attempt) {
+    if (!state.running || state.stoppedByUser) return;
+    attempt = attempt || 0;
+
+    const vids = collectVideos();
+
+    // 站点已经自己开始播别的部分了：跟着走
+    for (let i = 0; i < vids.length; i++) {
+      const x = vids[i];
+      if (x !== fromVideo && !x.paused && !x.ended && isVisible(x)) {
+        log('info', '站点已自动播放下一部分，脚本不干预');
+        adoptActive(x);
+        return;
+      }
+    }
+
+    let v = target.video;
+    if (!v || !v.isConnected) {
+      const fresh = findNextPart(fromVideo, vids);
+      if (fresh && fresh.video) { target = fresh; v = fresh.video; }
+      else v = null;
+    }
+
+    if (!v) {
+      if (attempt >= 3) {
+        // 宁可停在这里，也不越过剩余的 Part 跳到下一章
+        log('warn', '下一部分视频没能加载出来，停在当前部分（不会跳章）');
+        return;
+      }
+      if (target.heading && target.heading.el) {
+        try { target.heading.el.scrollIntoView({ block: 'center' }); } catch (e) { /* 忽略 */ }
+        log('info', '滚动到下一部分，等待播放器加载…');
+      }
+      setTimeout(function () { goToNextPart(target, fromVideo, attempt + 1); }, 1200);
+      return;
+    }
+
+    try { v.scrollIntoView({ block: 'center' }); } catch (e) { /* 忽略 */ }
+    adoptActive(v);
+    applyTo(v);
+    v.__htapEndedHandled = false;
+    v.__htapAutoTried = true;
+
+    let p = null;
+    try { p = v.play(); } catch (e) { log('warn', '播放下一部分异常：' + e.message); return; }
+    if (p && typeof p.then === 'function') {
+      p.then(function () {
+        log('info', '已开始播放下一部分（' + target.reason + '）');
+      }).catch(function (err) {
+        if (err && err.name === 'NotAllowedError') {
+          log('warn', '浏览器阻止自动播放下一部分，请点一次视频');
+          armGesturePlay();
+        } else if (!err || err.name !== 'AbortError') {
+          log('warn', '播放下一部分失败：' + (err && err.message ? err.message : '未知'));
+        }
+      });
+    } else {
+      log('info', '已尝试播放下一部分（' + target.reason + '）');
+    }
   }
 
   function applyTo(v) {
@@ -301,9 +497,9 @@
     if (!state.running || state.stoppedByUser) return;
     if (v.__htapEndedHandled) return;
 
-    // 必须严格是主播放器：iframe 内常有多余的 <video>（预加载/封面/广告）
-    if (v !== state.primary) {
-      log('info', '非主视频结束，忽略');
+    // 多播放器堆叠时只认「当前正在看的那个」，其它播放器的 ended 一律忽略
+    if (v !== state.active) {
+      log('info', '非当前视频结束，忽略');
       return;
     }
     if (!isVisible(v)) {
@@ -324,6 +520,13 @@
 
     if (!cfg.autoNext) {
       log('info', '自动下一讲已关闭，停在当前讲');
+      return;
+    }
+
+    // 本小节还有没播完的 Part：先播完，绝不能直接跳下一章
+    const next = findNextPart(v, collectVideos());
+    if (next) {
+      scheduleNextPart(next, v);
       return;
     }
 
@@ -442,9 +645,15 @@
       'span, i, em, b, li'
     ];
 
-    let found = null;
+    const cands = [];
+    const addCand = function (el) {
+      for (let i = 0; i < cands.length; i++) {
+        if (cands[i] === el || cands[i].contains(el) || el.contains(cands[i])) return;
+      }
+      cands.push(el);
+    };
 
-    for (let g = 0; g < groups.length && !found; g++) {
+    for (let g = 0; g < groups.length; g++) {
       let list = [];
       try { list = Array.prototype.slice.call(document.querySelectorAll(groups[g])); } catch (e) { list = []; }
 
@@ -453,8 +662,29 @@
         if (g === 1 && el.children && el.children.length > 0) continue;
         if (!isNextLabel(el)) continue;
         if (!isVisible(el) || isDisabled(el)) continue;
-        found = el;
-        break;
+        addCand(el);
+      }
+    }
+
+    if (!cands.length) return null;
+
+    // 多 Part 页面里可能有多个「下一讲」：选离当前播放器最近的那个
+    let found = cands[0];
+    const ref = state.active || state.primary;
+    if (ref && ref.getBoundingClientRect) {
+      let rr = null;
+      try { rr = ref.getBoundingClientRect(); } catch (e) { rr = null; }
+      if (rr) {
+        const rc = rr.top + rr.height / 2;
+        let best = Infinity;
+        for (let i = 0; i < cands.length; i++) {
+          let r;
+          try { r = cands[i].getBoundingClientRect(); } catch (e) { continue; }
+          // 位于播放器上方的（上一讲方向）排到最后
+          const above = r.top < rr.top ? 100000 : 0;
+          const d = Math.abs((r.top + r.height / 2) - rc) + above;
+          if (d < best) { best = d; found = cands[i]; }
+        }
       }
     }
 
@@ -690,6 +920,10 @@
       requestNext('子框架请求切课');
       return;
     }
+    if (d.__htap === 'diagdata' && d.data) {
+      state.childDiag = d.data;
+      return;
+    }
     if (d.__htap === 'state' && d.data) {
       state.child = {
         at: Date.now(),
@@ -718,14 +952,27 @@
       startAutomation();
     } else if (d.cmd === 'rescan') {
       state.primary = null;
+      state.active = null;
+      clearTimeout(partTimer); partTimer = null;
+      resetPartCache();
       state.lastCourseScan = 0;
       scheduleScan(0);
     } else if (d.cmd === 'next') {
-      if (state.primary && state.running && state.nextState === 'idle') {
-        state.nextState = 'waiting';
-        state.nextAttempts = 0;
-        doNext('主框架手动');
+      if (state.running && state.nextState === 'idle') {
+        if (state.active) {
+          const nxt = findNextPart(state.active, collectVideos());
+          if (nxt) {
+            log('info', '手动：先播放本小节下一部分');
+            goToNextPart(nxt, state.active, 0);
+            return;
+          }
+          state.nextState = 'waiting';
+          state.nextAttempts = 0;
+          doNext('主框架手动');
+        }
       }
+    } else if (d.cmd === 'diag') {
+      sendToTop('diagdata', { data: childStructure() });
     } else if (d.cmd === 'cfg' && d.cfg) {
       if (typeof d.cfg.rate === 'number') cfg.rate = clamp(d.cfg.rate, 0.25, 8);
       if (typeof d.cfg.volume === 'number') cfg.volume = clamp(d.cfg.volume, 0, 1);
@@ -757,6 +1004,9 @@
     state.nextState = 'idle';
     state.nextBlockedUntil = 0;
     state.primary = null;
+    state.active = null;
+    clearTimeout(partTimer); partTimer = null;
+    resetPartCache();
     state.lastCourseScan = 0;
     log('info', '路由变化，重新扫描播放器');
     scheduleScan(400);
@@ -838,17 +1088,17 @@
       for (let i = 0; i < vids.length; i++) bindVideo(vids[i]);
 
       state.videoCount = vids.length;
-      const primary = pickPrimary(vids);
+      const active = resolveActive(vids);
 
-      if (primary !== state.primary) {
-        state.primary = primary;
-        if (primary) {
-          if (primary !== state.lastLoggedVideo) {
-            state.lastLoggedVideo = primary;
-            log('info', '识别到播放器（' + (primary.currentSrc ? '已有媒体源' : '暂无媒体源') + '）');
+      if (active !== state.active) {
+        adoptActive(active);
+        if (active) {
+          if (active !== state.lastLoggedVideo) {
+            state.lastLoggedVideo = active;
+            log('info', '识别到播放器（' + (active.currentSrc ? '已有媒体源' : '暂无媒体源') + '）');
           }
-          applyTo(primary);
-          tryAutoplay(primary);
+          applyTo(active);
+          tryAutoplay(active);
         }
       }
 
@@ -868,7 +1118,9 @@
       }
 
       // 无视频小节（图文/课件）：停留一段时间后自动点击「下一讲」
-      if (!state.primary) {
+      // 注意：这里必须判断"整个文档一个视频都没有"，不能只看 primary，
+      // 否则多 Part 页面切 part 的瞬间会被误判成图文页而跳章。
+      if (!vids.length) {
         if (!state.noVideoSince) state.noVideoSince = Date.now();
         const waited = Date.now() - state.noVideoSince;
         // 顶层页面里如果有 iframe，说明播放器/内容在子框架，交给子框架处理，避免重复点击
@@ -926,6 +1178,7 @@
     state.stoppedByUser = false;
     state.startedAt = Date.now();
     state.nextState = 'idle';
+    resetPartCache();
 
     attachObserver();
     clearInterval(tickTimer);
@@ -946,6 +1199,7 @@
     clearInterval(tickTimer); tickTimer = null;
     clearTimeout(scanTimer); scanTimer = null;
     clearTimeout(nextTimer); nextTimer = null;
+    clearTimeout(partTimer); partTimer = null;
 
     state.nextState = 'idle';
     restoreVideos();
@@ -1155,6 +1409,9 @@
 
     els.rescan.addEventListener('click', function () {
       state.primary = null;
+      state.active = null;
+      clearTimeout(partTimer); partTimer = null;
+      resetPartCache();
       state.lastCourseScan = 0;
       scheduleScan(0);
       broadcast('rescan');
@@ -1162,17 +1419,23 @@
     });
 
     els.diag.addEventListener('click', function () {
-      const d = collectDiagnostics();
-      console.log('[HTAP] 诊断信息', d);
-      log('info', '视频 ' + d.videos.length + ' / iframe ' + d.iframes.length +
-        ' / canvas ' + d.canvas + ' / nextState ' + d.nextState);
-      try {
-        if (navigator.clipboard && navigator.clipboard.writeText) {
-          navigator.clipboard.writeText(JSON.stringify(d, null, 2)).then(function () {
-            log('info', '诊断信息已复制到剪贴板');
-          }, function () { /* 忽略 */ });
-        }
-      } catch (e) { /* 忽略 */ }
+      // 顺带向子框架要一份视频 / Part 结构，一并复制到剪贴板
+      state.childDiag = null;
+      broadcast('diag');
+      setTimeout(function () {
+        const d = collectDiagnostics();
+        console.log('[HTAP] 诊断信息', d);
+        log('info', '视频 ' + d.videos.length + ' / iframe ' + d.iframes.length +
+          ' / canvas ' + d.canvas + ' / nextState ' + d.nextState +
+          ' / 子框架视频 ' + (d.childDiag && d.childDiag.videos ? d.childDiag.videos.length : '?'));
+        try {
+          if (navigator.clipboard && navigator.clipboard.writeText) {
+            navigator.clipboard.writeText(JSON.stringify(d, null, 2)).then(function () {
+              log('info', '诊断信息已复制到剪贴板');
+            }, function () { /* 忽略 */ });
+          }
+        } catch (e) { /* 忽略 */ }
+      }, 800);
     });
 
     els.stop.addEventListener('click', function () {
@@ -1297,6 +1560,61 @@
   /* ------------------------------------------------------------------ *
    * 10. 诊断
    * ------------------------------------------------------------------ */
+  // 子框架回报给主框架的结构快照（诊断按钮会把它一起复制到剪贴板）
+  function childStructure() {
+    const vids = collectVideos();
+    const ordered = orderedVideos(partVideos(vids));
+    const videos = [];
+    for (let i = 0; i < ordered.length; i++) {
+      const v = ordered[i];
+      let r = null;
+      try { r = v.getBoundingClientRect(); } catch (e) { r = null; }
+      videos.push({
+        top: Math.round(absTop(v)),
+        size: r ? Math.round(r.width) + 'x' + Math.round(r.height) : '?',
+        src: String(v.currentSrc || v.getAttribute('src') || '').slice(0, 50),
+        t: Math.round((v.currentTime || 0) * 10) / 10,
+        d: isFinite(v.duration) ? Math.round(v.duration * 10) / 10 : 0,
+        paused: v.paused,
+        ended: v.ended,
+        active: v === state.active
+      });
+    }
+
+    const parts = [];
+    try {
+      const hs = getPartHeadings();
+      for (let i = 0; i < hs.length; i++) {
+        parts.push({ text: normText(hs[i].el).slice(0, 12), top: Math.round(hs[i].top) });
+      }
+    } catch (e) { /* 忽略 */ }
+
+    const nextButtons = [];
+    try {
+      document.querySelectorAll('button, a, div, span').forEach(function (el) {
+        if (el.children && el.children.length > 0) return;
+        const t = normText(el);
+        if (t !== '上一讲' && t !== '下一讲' && t !== '下一节') return;
+        let r;
+        try { r = el.getBoundingClientRect(); } catch (e) { return; }
+        nextButtons.push({
+          text: t,
+          top: Math.round(r.top + (window.pageYOffset || 0)),
+          left: Math.round(r.left),
+          w: Math.round(r.width)
+        });
+      });
+    } catch (e) { /* 忽略 */ }
+
+    return {
+      url: location.href,
+      videos: videos,
+      partHeadings: parts,
+      nextButtons: nextButtons,
+      activeTop: state.active ? Math.round(absTop(state.active)) : null
+    };
+  }
+
   function collectDiagnostics() {
     const videos = [];
     try {
@@ -1340,8 +1658,11 @@
       } : null,
       nextState: state.nextState,
       nextButtonFound: !!findNextButton(),
+      activeTop: state.active ? Math.round(absTop(state.active)) : null,
+      childDiag: state.childDiag || null,
       course: state.course,
       child: state.child,
+      structure: IS_TOP ? null : childStructure(),
       log: logBuf.slice(-30)
     };
   }
